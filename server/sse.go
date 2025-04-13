@@ -76,18 +76,18 @@ var _ ClientSession = (*sseSession)(nil)
 // SSEServer implements a Server-Sent Events (SSE) based MCP server.
 // It provides real-time communication capabilities over HTTP using the SSE protocol.
 type SSEServer struct {
-	server          *MCPServer
-	baseURL         string
-	basePath        string
-  useFullURLForMessageEndpoint bool
-	messageEndpoint string
-	sseEndpoint     string
-  ssePattern      string
-	sessions        sync.Map
-	srv             *http.Server
-	contextFunc     SSEContextFunc
-	keepAlive         bool
-	keepAliveInterval time.Duration
+	server                       *MCPServer
+	baseURL                      string
+	basePath                     string
+	useFullURLForMessageEndpoint bool
+	messageEndpoint              string
+	sseEndpoint                  string
+	ssePattern                   string
+	sessions                     sync.Map
+	srv                          *http.Server
+	contextFunc                  SSEContextFunc
+	keepAlive                    bool
+	keepAliveInterval            time.Duration
 }
 
 // SSEOption defines a function type for configuring SSEServer
@@ -187,12 +187,12 @@ func WithSSEContextFunc(fn SSEContextFunc) SSEOption {
 // NewSSEServer creates a new SSE server instance with the given MCP server and options.
 func NewSSEServer(server *MCPServer, opts ...SSEOption) *SSEServer {
 	s := &SSEServer{
-		server:            server,
-		sseEndpoint:       "/sse",
-		messageEndpoint:   "/message",
-    useFullURLForMessageEndpoint: true,
-		keepAlive:         false,
-		keepAliveInterval: 10 * time.Second,
+		server:                       server,
+		sseEndpoint:                  "/sse",
+		messageEndpoint:              "/message",
+		useFullURLForMessageEndpoint: true,
+		keepAlive:                    false,
+		keepAliveInterval:            10 * time.Second,
 	}
 
 	// Apply all options
@@ -331,7 +331,6 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-
 	// Send the initial endpoint event
 	fmt.Fprintf(w, "event: endpoint\ndata: %s\r\n\r\n", s.GetMessageEndpointForClient(sessionID))
 	flusher.Flush()
@@ -365,10 +364,23 @@ func (s *SSEServer) GetMessageEndpointForClient(sessionID string) string {
 // handleMessage processes incoming JSON-RPC messages from clients and sends responses
 // back through both the SSE connection and HTTP response.
 func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
+	// Handle CORS preflight requests
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_REQUEST, "Method not allowed")
 		return
 	}
+
+	// Set CORS headers for regular requests too
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	sessionID := r.URL.Query().Get("sessionId")
 	if sessionID == "" {
@@ -439,6 +451,7 @@ func (s *SSEServer) writeJSONRPCError(
 ) {
 	response := createErrorResponse(id, code, message)
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusBadRequest)
 	json.NewEncoder(w).Encode(response)
 }
