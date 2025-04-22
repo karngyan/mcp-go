@@ -23,6 +23,7 @@ type sseSession struct {
 	done                chan struct{}
 	eventQueue          chan string // Channel for queuing events
 	sessionID           string
+	requestID           atomic.Int64
 	notificationChannel chan mcp.JSONRPCNotification
 	initialized         atomic.Bool
 	routeParams         RouteParams // Store route parameters in session
@@ -86,8 +87,11 @@ type SSEServer struct {
 	sessions                     sync.Map
 	srv                          *http.Server
 	contextFunc                  SSEContextFunc
-	keepAlive                    bool
-	keepAliveInterval            time.Duration
+
+	keepAlive         bool
+	keepAliveInterval time.Duration
+
+	mu sync.RWMutex
 }
 
 // SSEOption defines a function type for configuring SSEServer
@@ -205,10 +209,7 @@ func NewSSEServer(server *MCPServer, opts ...SSEOption) *SSEServer {
 
 // NewTestServer creates a test server for testing purposes
 func NewTestServer(server *MCPServer, opts ...SSEOption) *httptest.Server {
-	sseServer := NewSSEServer(server)
-	for _, opt := range opts {
-		opt(sseServer)
-	}
+	sseServer := NewSSEServer(server, opts...)
 
 	testServer := httptest.NewServer(sseServer)
 	sseServer.baseURL = testServer.URL
@@ -218,10 +219,12 @@ func NewTestServer(server *MCPServer, opts ...SSEOption) *httptest.Server {
 // Start begins serving SSE connections on the specified address.
 // It sets up HTTP handlers for SSE and message endpoints.
 func (s *SSEServer) Start(addr string) error {
+	s.mu.Lock()
 	s.srv = &http.Server{
 		Addr:    addr,
 		Handler: s,
 	}
+	s.mu.Unlock()
 
 	return s.srv.ListenAndServe()
 }
@@ -229,7 +232,11 @@ func (s *SSEServer) Start(addr string) error {
 // Shutdown gracefully stops the SSE server, closing all active sessions
 // and shutting down the HTTP server.
 func (s *SSEServer) Shutdown(ctx context.Context) error {
-	if s.srv != nil {
+	s.mu.RLock()
+	srv := s.srv
+	s.mu.RUnlock()
+
+	if srv != nil {
 		s.sessions.Range(func(key, value interface{}) bool {
 			if session, ok := value.(*sseSession); ok {
 				close(session.done)
@@ -238,7 +245,7 @@ func (s *SSEServer) Shutdown(ctx context.Context) error {
 			return true
 		})
 
-		return s.srv.Shutdown(ctx)
+		return srv.Shutdown(ctx)
 	}
 	return nil
 }
@@ -288,7 +295,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Session registration failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer s.server.UnregisterSession(sessionID)
+	defer s.server.UnregisterSession(r.Context(), sessionID)
 
 	// Start notification handler for this session
 	go func() {
@@ -320,8 +327,16 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 			for {
 				select {
 				case <-ticker.C:
-					//: ping - 2025-03-27 07:44:38.682659+00:00
-					session.eventQueue <- fmt.Sprintf(":ping - %s\n\n", time.Now().Format(time.RFC3339))
+					message := mcp.JSONRPCRequest{
+						JSONRPC: "2.0",
+						ID:      session.requestID.Add(1),
+						Request: mcp.Request{
+							Method: "ping",
+						},
+					}
+					messageBytes, _ := json.Marshal(message)
+					pingMsg := fmt.Sprintf("event: message\ndata:%s\n\n", messageBytes)
+					session.eventQueue <- pingMsg
 				case <-session.done:
 					return
 				case <-r.Context().Done():
@@ -387,7 +402,6 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, "Missing sessionId")
 		return
 	}
-
 	sessionI, ok := s.sessions.Load(sessionID)
 	if !ok {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, "Invalid session ID")
